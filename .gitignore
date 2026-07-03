@@ -1,0 +1,17 @@
+# Build output
+bin/
+obj/
+
+# Local sync state and secrets — never commit these
+sync.db
+sync.db-shm
+sync.db-wal
+token_store/
+appsettings.Local.json
+credentials/
+webapi*.log
+
+# IDE
+.vs/
+.idea/
+*.user
