@@ -225,7 +225,7 @@ app.MapGet("/events", async (SyncDbContext db, CancellationToken ct, bool includ
             e.GoogleUpdated))
         .ToListAsync(ct);
 
-    return Results.Ok(events);
+    return Results.Ok(new EventListResponse(events.Count, events));
 })
     .WithName("ListEvents")
     .WithTags("Events");
@@ -386,6 +386,10 @@ public sealed record EventResponse(
     bool IsDirty,
     DateTime LastModified,
     DateTime? GoogleUpdated);
+
+public sealed record EventListResponse(
+    int Count,
+    IReadOnlyList<EventResponse> Events);
 
 public sealed record SyncRunResponse(
     DateTime StartedUtc,
