@@ -17,6 +17,12 @@ public class LocalEvent
     /// <summary>The Google Calendar event id. Null until the event has been pushed to Google.</summary>
     public string? GoogleEventId { get; set; }
 
+    /// <summary>The employee Google account that owns this local row.</summary>
+    public string OwnerEmail { get; set; } = string.Empty;
+
+    /// <summary>The Google calendar id this row belongs to. Usually "primary".</summary>
+    public string CalendarId { get; set; } = "primary";
+
     // --- Event payload -----------------------------------------------------
     public string? Summary { get; set; }
     public string? Description { get; set; }

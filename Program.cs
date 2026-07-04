@@ -1,10 +1,14 @@
 using GoogleCalendarSync.Configuration;
 using GoogleCalendarSync.Data;
 using GoogleCalendarSync.Services;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.OpenApi.Models;
+using System.Collections.Concurrent;
+using System.Security.Claims;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -14,14 +18,21 @@ var googleOptions = builder.Configuration.GetSection("Google").Get<GoogleOptions
 var syncOptions = builder.Configuration.GetSection("Sync").Get<SyncOptions>() ?? new SyncOptions();
 syncOptions.DatabasePath = ResolveDatabasePath(syncOptions.DatabasePath);
 
-var syncGate = new SemaphoreSlim(1, 1);
+var syncGates = new ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase);
 
 builder.Services.AddSingleton(googleOptions);
 builder.Services.AddSingleton(syncOptions);
-builder.Services.AddSingleton(syncGate);
+builder.Services.AddSingleton(syncGates);
 builder.Services.AddSingleton(sp => new GoogleCalendarService(sp.GetRequiredService<GoogleOptions>()));
 builder.Services.AddScoped(sp => new SyncDbContext(sp.GetRequiredService<SyncOptions>().DatabasePath));
 builder.Services.AddScoped<SyncService>();
+builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
+    .AddCookie(options =>
+    {
+        options.LoginPath = "/auth/google";
+        options.AccessDeniedPath = "/auth/status";
+    });
+builder.Services.AddAuthorization();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(options =>
 {
@@ -29,7 +40,7 @@ builder.Services.AddSwaggerGen(options =>
     {
         Title = "GoogleCalendarSync API",
         Version = "v1",
-        Description = "Web API for authenticating with Google Calendar, running two-way sync, and managing local calendar events."
+        Description = "Multi-employee Web API for Google Calendar OAuth, two-way sync, and local event management."
     });
 });
 
@@ -41,6 +52,8 @@ app.UseSwaggerUI(options =>
     options.SwaggerEndpoint("/swagger/v1/swagger.json", "GoogleCalendarSync API v1");
     options.RoutePrefix = "swagger";
 });
+app.UseAuthentication();
+app.UseAuthorization();
 
 app.Lifetime.ApplicationStarted.Register(() =>
 {
@@ -61,53 +74,58 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<SyncDbContext>();
     await db.Database.EnsureCreatedAsync();
+    await db.EnsureAppSchemaAsync();
 }
 
 Console.WriteLine($"SQLite database: {syncOptions.DatabasePath}");
-
-var google = app.Services.GetRequiredService<GoogleCalendarService>();
-var restoredCredential = await google.TryAuthenticateFromStoreAsync();
-
-Console.WriteLine(restoredCredential
-    ? "Google authentication loaded from token store."
-    : "Google authentication required. Open /auth/google after the API starts.");
+Console.WriteLine("Employees authenticate individually at /auth/google.");
 
 app.MapGet("/", () => Results.Ok(new
 {
     name = "GoogleCalendarSync API",
+    mode = "Multi-employee OAuth",
     endpoints = new[]
     {
         "GET /health",
         "GET /auth/status",
-        "GET /auth/google",
+        "GET /auth/google?loginHint=employee@example.com",
         "GET /auth/google/callback",
+        "POST /auth/logout",
+        "GET /employees",
+        "GET /employees/{employeeEmail}/auth/status",
+        "GET /employees/{employeeEmail}/sync/status",
+        "POST /employees/{employeeEmail}/sync/run",
+        "GET /employees/{employeeEmail}/events",
+        "GET /employees/{employeeEmail}/events/{id}",
+        "POST /employees/{employeeEmail}/events",
+        "PUT /employees/{employeeEmail}/events/{id}",
+        "DELETE /employees/{employeeEmail}/events/{id}",
         "GET /swagger",
-        "GET /swagger/v1/swagger.json",
-        "GET /sync/status",
-        "POST /sync/run",
-        "GET /events",
-        "GET /events/{id}",
-        "POST /events",
-        "PUT /events/{id}",
-        "DELETE /events/{id}"
+        "GET /swagger/v1/swagger.json"
     }
 }))
-.WithName("GetApiIndex")
-.WithTags("System");
+    .WithName("GetApiIndex")
+    .WithTags("System");
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }))
     .WithName("GetHealth")
     .WithTags("System");
 
-app.MapGet("/auth/status", (GoogleCalendarService googleService) =>
-    Results.Ok(new { isAuthenticated = googleService.IsAuthenticated }))
+app.MapGet("/auth/status", async (HttpContext context, GoogleCalendarService googleService, CancellationToken ct) =>
+{
+    var employees = await googleService.ListAuthenticatedEmployeesAsync(ct);
+    return Results.Ok(new AuthStatusResponse(
+        GetCurrentEmployeeEmail(context),
+        employees.Count,
+        employees));
+})
     .WithName("GetAuthStatus")
     .WithTags("Authentication");
 
-app.MapGet("/auth/google", (HttpRequest request, GoogleCalendarService googleService) =>
+app.MapGet("/auth/google", (string? loginHint, HttpRequest request, GoogleCalendarService googleService) =>
 {
     var redirectUri = BuildGoogleRedirectUri(request);
-    var authorizationUrl = googleService.CreateAuthorizationUrl(redirectUri);
+    var authorizationUrl = googleService.CreateAuthorizationUrl(redirectUri, loginHint);
     return Results.Redirect(authorizationUrl);
 })
     .WithName("StartGoogleAuth")
@@ -116,6 +134,7 @@ app.MapGet("/auth/google", (HttpRequest request, GoogleCalendarService googleSer
 app.MapGet("/auth/google/callback", async (
     string? code,
     string? error,
+    HttpContext context,
     HttpRequest request,
     GoogleCalendarService googleService,
     CancellationToken ct) =>
@@ -126,64 +145,142 @@ app.MapGet("/auth/google/callback", async (
     if (string.IsNullOrWhiteSpace(code))
         return Results.BadRequest(new { error = "Missing authorization code." });
 
-    await googleService.AuthenticateWithCodeAsync(code, BuildGoogleRedirectUri(request), ct);
+    var employee = await googleService.AuthenticateWithCodeAsync(code, BuildGoogleRedirectUri(request), ct);
+    await SignInEmployeeAsync(context, employee);
 
-    return Results.Content(
-        "Google Calendar authentication complete. You can close this tab and use the API.",
-        "text/plain");
+    return Results.Ok(new AuthenticatedEmployeeResponse(
+        employee.Email,
+        employee.Name,
+        employee.EmailVerified,
+        employee.HostedDomain,
+        $"/employees/{Uri.EscapeDataString(employee.Email)}/sync/run",
+        $"/employees/{Uri.EscapeDataString(employee.Email)}/events"));
 })
     .WithName("CompleteGoogleAuth")
     .WithTags("Authentication");
 
-app.MapGet("/sync/status", async (
+app.MapPost("/auth/logout", async (HttpContext context) =>
+{
+    await context.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+    return Results.Ok(new { signedOut = true });
+})
+    .WithName("Logout")
+    .WithTags("Authentication");
+
+app.MapGet("/employees", async (HttpContext context, GoogleCalendarService googleService, CancellationToken ct) =>
+{
+    var employees = await googleService.ListAuthenticatedEmployeesAsync(ct);
+    return Results.Ok(new AuthStatusResponse(
+        GetCurrentEmployeeEmail(context),
+        employees.Count,
+        employees));
+})
+    .WithName("ListEmployees")
+    .WithTags("Employees");
+
+app.MapGet("/employees/{employeeEmail}/auth/status", async (
+    string employeeEmail,
+    HttpContext context,
+    GoogleCalendarService googleService,
+    CancellationToken ct) =>
+{
+    if (NormalizeEmployeeEmail(employeeEmail) is not { } normalizedEmail)
+        return Results.BadRequest(new { error = "employeeEmail must be a valid email address." });
+
+    if (ValidateEmployeeAccess(context, normalizedEmail) is { } accessError)
+        return accessError;
+
+    var isAuthenticated = await googleService.IsAuthenticatedAsync(normalizedEmail, ct);
+    return Results.Ok(new EmployeeAuthStatusResponse(normalizedEmail, isAuthenticated));
+})
+    .WithName("GetEmployeeAuthStatus")
+    .WithTags("Employees");
+
+app.MapGet("/employees/{employeeEmail}/sync/status", async (
+    string employeeEmail,
+    HttpContext context,
     SyncDbContext db,
     SyncOptions options,
     GoogleCalendarService googleService,
-    SemaphoreSlim gate,
-    CancellationToken ct) =>
+    ConcurrentDictionary<string, SemaphoreSlim> gates,
+    CancellationToken ct,
+    string calendarId = GoogleCalendarService.DefaultCalendarId) =>
 {
-    var lastSyncUtc = await db.GetMetadataAsync(SyncMetadata.Keys.LastSyncUtc, ct);
-    var hasSyncToken = !string.IsNullOrEmpty(await db.GetMetadataAsync(SyncMetadata.Keys.NextSyncToken, ct));
+    if (NormalizeEmployeeEmail(employeeEmail) is not { } normalizedEmail)
+        return Results.BadRequest(new { error = "employeeEmail must be a valid email address." });
 
-    return Results.Ok(new
-    {
-        isRunning = gate.CurrentCount == 0,
-        isAuthenticated = googleService.IsAuthenticated,
+    if (ValidateEmployeeAccess(context, normalizedEmail) is { } accessError)
+        return accessError;
+
+    calendarId = NormalizeCalendarId(calendarId);
+    var lastSyncUtc = await db.GetMetadataAsync(normalizedEmail, calendarId, SyncMetadata.Keys.LastSyncUtc, ct);
+    var hasSyncToken = !string.IsNullOrEmpty(await db.GetMetadataAsync(
+        normalizedEmail,
+        calendarId,
+        SyncMetadata.Keys.NextSyncToken,
+        ct));
+    var isAuthenticated = await googleService.IsAuthenticatedAsync(normalizedEmail, ct);
+    var gate = GetSyncGate(gates, normalizedEmail, calendarId);
+
+    return Results.Ok(new SyncStatusResponse(
+        normalizedEmail,
+        calendarId,
+        gate.CurrentCount == 0,
+        isAuthenticated,
         lastSyncUtc,
         hasSyncToken,
-        intervalMinutes = options.IntervalMinutes,
-        conflictStrategy = options.ConflictStrategy.ToString(),
-        databasePath = options.DatabasePath
-    });
+        options.IntervalMinutes,
+        options.ConflictStrategy.ToString(),
+        options.DatabasePath));
 })
-    .WithName("GetSyncStatus")
+    .WithName("GetEmployeeSyncStatus")
     .WithTags("Sync");
 
-app.MapPost("/sync/run", async (
+app.MapPost("/employees/{employeeEmail}/sync/run", async (
+    string employeeEmail,
+    HttpContext context,
     SyncService sync,
     GoogleCalendarService googleService,
-    SemaphoreSlim gate,
-    CancellationToken ct) =>
+    ConcurrentDictionary<string, SemaphoreSlim> gates,
+    CancellationToken ct,
+    string calendarId = GoogleCalendarService.DefaultCalendarId) =>
 {
-    if (!googleService.IsAuthenticated)
-        return Results.Json(
-            new { error = "Google is not authenticated. Open /auth/google first." },
-            statusCode: StatusCodes.Status401Unauthorized);
+    if (NormalizeEmployeeEmail(employeeEmail) is not { } normalizedEmail)
+        return Results.BadRequest(new { error = "employeeEmail must be a valid email address." });
 
+    if (ValidateEmployeeAccess(context, normalizedEmail) is { } accessError)
+        return accessError;
+
+    calendarId = NormalizeCalendarId(calendarId);
+
+    if (!await googleService.IsAuthenticatedAsync(normalizedEmail, ct))
+    {
+        return Results.Json(
+            new
+            {
+                error = $"Google is not authenticated for '{normalizedEmail}'.",
+                authUrl = $"/auth/google?loginHint={Uri.EscapeDataString(normalizedEmail)}"
+            },
+            statusCode: StatusCodes.Status401Unauthorized);
+    }
+
+    var gate = GetSyncGate(gates, normalizedEmail, calendarId);
     if (!await gate.WaitAsync(0, ct))
-        return Results.Conflict(new { error = "A sync run is already in progress." });
+        return Results.Conflict(new { error = "A sync run is already in progress for this employee/calendar." });
 
     var startedUtc = DateTime.UtcNow;
 
     try
     {
-        var summary = await sync.RunAsync(ct);
+        var summary = await sync.RunAsync(normalizedEmail, calendarId, ct);
         var finishedUtc = DateTime.UtcNow;
 
         return Results.Ok(new SyncRunResponse(
-            StartedUtc: startedUtc,
-            FinishedUtc: finishedUtc,
-            Summary: ToSyncSummaryResponse(summary)));
+            normalizedEmail,
+            calendarId,
+            startedUtc,
+            finishedUtc,
+            ToSyncSummaryResponse(summary)));
     }
     catch (OperationCanceledException)
     {
@@ -198,12 +295,27 @@ app.MapPost("/sync/run", async (
         gate.Release();
     }
 })
-    .WithName("RunSync")
+    .WithName("RunEmployeeSync")
     .WithTags("Sync");
 
-app.MapGet("/events", async (SyncDbContext db, CancellationToken ct, bool includeDeleted = false) =>
+app.MapGet("/employees/{employeeEmail}/events", async (
+    string employeeEmail,
+    HttpContext context,
+    SyncDbContext db,
+    CancellationToken ct,
+    string calendarId = GoogleCalendarService.DefaultCalendarId,
+    bool includeDeleted = false) =>
 {
-    var query = db.Events.AsNoTracking();
+    if (NormalizeEmployeeEmail(employeeEmail) is not { } normalizedEmail)
+        return Results.BadRequest(new { error = "employeeEmail must be a valid email address." });
+
+    if (ValidateEmployeeAccess(context, normalizedEmail) is { } accessError)
+        return accessError;
+
+    calendarId = NormalizeCalendarId(calendarId);
+    var query = db.Events
+        .AsNoTracking()
+        .Where(e => e.OwnerEmail == normalizedEmail && e.CalendarId == calendarId);
 
     if (!includeDeleted)
         query = query.Where(e => !e.IsDeleted);
@@ -212,6 +324,8 @@ app.MapGet("/events", async (SyncDbContext db, CancellationToken ct, bool includ
         .OrderBy(e => e.StartUtc)
         .Select(e => new EventResponse(
             e.Id,
+            e.OwnerEmail,
+            e.CalendarId,
             e.GoogleEventId,
             e.Summary,
             e.Description,
@@ -225,45 +339,101 @@ app.MapGet("/events", async (SyncDbContext db, CancellationToken ct, bool includ
             e.GoogleUpdated))
         .ToListAsync(ct);
 
-    return Results.Ok(new EventListResponse(events.Count, events));
+    return Results.Ok(new EventListResponse(normalizedEmail, calendarId, events.Count, events));
 })
-    .WithName("ListEvents")
+    .WithName("ListEmployeeEvents")
     .WithTags("Events");
 
-app.MapGet("/events/{id:int}", async (int id, SyncDbContext db, CancellationToken ct) =>
+app.MapGet("/employees/{employeeEmail}/events/{id:int}", async (
+    string employeeEmail,
+    int id,
+    HttpContext context,
+    SyncDbContext db,
+    CancellationToken ct,
+    string calendarId = GoogleCalendarService.DefaultCalendarId) =>
 {
-    var local = await db.Events.AsNoTracking().FirstOrDefaultAsync(e => e.Id == id, ct);
+    if (NormalizeEmployeeEmail(employeeEmail) is not { } normalizedEmail)
+        return Results.BadRequest(new { error = "employeeEmail must be a valid email address." });
+
+    if (ValidateEmployeeAccess(context, normalizedEmail) is { } accessError)
+        return accessError;
+
+    calendarId = NormalizeCalendarId(calendarId);
+    var local = await db.Events
+        .AsNoTracking()
+        .FirstOrDefaultAsync(e =>
+            e.Id == id &&
+            e.OwnerEmail == normalizedEmail &&
+            e.CalendarId == calendarId, ct);
+
     return local is null ? Results.NotFound() : Results.Ok(ToEventResponse(local));
 })
-    .WithName("GetEvent")
+    .WithName("GetEmployeeEvent")
     .WithTags("Events");
 
-app.MapPost("/events", async (EventRequest request, SyncDbContext db, CancellationToken ct) =>
+app.MapPost("/employees/{employeeEmail}/events", async (
+    string employeeEmail,
+    HttpContext context,
+    EventRequest request,
+    SyncDbContext db,
+    CancellationToken ct,
+    string calendarId = GoogleCalendarService.DefaultCalendarId) =>
 {
+    if (NormalizeEmployeeEmail(employeeEmail) is not { } normalizedEmail)
+        return Results.BadRequest(new { error = "employeeEmail must be a valid email address." });
+
+    if (ValidateEmployeeAccess(context, normalizedEmail) is { } accessError)
+        return accessError;
+
     var validationError = ValidateEvent(request);
     if (validationError is not null)
         return Results.BadRequest(new { error = validationError });
 
-    var local = new LocalEvent();
+    calendarId = NormalizeCalendarId(calendarId);
+    var local = new LocalEvent
+    {
+        OwnerEmail = normalizedEmail,
+        CalendarId = calendarId,
+        IsDirty = true,
+        LastModified = DateTime.UtcNow
+    };
     ApplyRequest(local, request);
-    local.IsDirty = true;
-    local.LastModified = DateTime.UtcNow;
 
     db.Events.Add(local);
     await db.SaveChangesAsync(ct);
 
-    return Results.Created($"/events/{local.Id}", ToEventResponse(local));
+    return Results.Created(
+        $"/employees/{Uri.EscapeDataString(normalizedEmail)}/events/{local.Id}",
+        ToEventResponse(local));
 })
-    .WithName("CreateEvent")
+    .WithName("CreateEmployeeEvent")
     .WithTags("Events");
 
-app.MapPut("/events/{id:int}", async (int id, EventRequest request, SyncDbContext db, CancellationToken ct) =>
+app.MapPut("/employees/{employeeEmail}/events/{id:int}", async (
+    string employeeEmail,
+    int id,
+    HttpContext context,
+    EventRequest request,
+    SyncDbContext db,
+    CancellationToken ct,
+    string calendarId = GoogleCalendarService.DefaultCalendarId) =>
 {
+    if (NormalizeEmployeeEmail(employeeEmail) is not { } normalizedEmail)
+        return Results.BadRequest(new { error = "employeeEmail must be a valid email address." });
+
+    if (ValidateEmployeeAccess(context, normalizedEmail) is { } accessError)
+        return accessError;
+
     var validationError = ValidateEvent(request);
     if (validationError is not null)
         return Results.BadRequest(new { error = validationError });
 
-    var local = await db.Events.FirstOrDefaultAsync(e => e.Id == id, ct);
+    calendarId = NormalizeCalendarId(calendarId);
+    var local = await db.Events.FirstOrDefaultAsync(e =>
+        e.Id == id &&
+        e.OwnerEmail == normalizedEmail &&
+        e.CalendarId == calendarId, ct);
+
     if (local is null)
         return Results.NotFound();
 
@@ -276,12 +446,29 @@ app.MapPut("/events/{id:int}", async (int id, EventRequest request, SyncDbContex
 
     return Results.Ok(ToEventResponse(local));
 })
-    .WithName("UpdateEvent")
+    .WithName("UpdateEmployeeEvent")
     .WithTags("Events");
 
-app.MapDelete("/events/{id:int}", async (int id, SyncDbContext db, CancellationToken ct) =>
+app.MapDelete("/employees/{employeeEmail}/events/{id:int}", async (
+    string employeeEmail,
+    int id,
+    HttpContext context,
+    SyncDbContext db,
+    CancellationToken ct,
+    string calendarId = GoogleCalendarService.DefaultCalendarId) =>
 {
-    var local = await db.Events.FirstOrDefaultAsync(e => e.Id == id, ct);
+    if (NormalizeEmployeeEmail(employeeEmail) is not { } normalizedEmail)
+        return Results.BadRequest(new { error = "employeeEmail must be a valid email address." });
+
+    if (ValidateEmployeeAccess(context, normalizedEmail) is { } accessError)
+        return accessError;
+
+    calendarId = NormalizeCalendarId(calendarId);
+    var local = await db.Events.FirstOrDefaultAsync(e =>
+        e.Id == id &&
+        e.OwnerEmail == normalizedEmail &&
+        e.CalendarId == calendarId, ct);
+
     if (local is null)
         return Results.NotFound();
 
@@ -300,7 +487,7 @@ app.MapDelete("/events/{id:int}", async (int id, SyncDbContext db, CancellationT
 
     return Results.NoContent();
 })
-    .WithName("DeleteEvent")
+    .WithName("DeleteEmployeeEvent")
     .WithTags("Events");
 
 await app.RunAsync();
@@ -313,6 +500,85 @@ static string ResolveDatabasePath(string configuredPath)
 
 static string BuildGoogleRedirectUri(HttpRequest request) =>
     $"{request.Scheme}://{request.Host}/auth/google/callback";
+
+static async Task SignInEmployeeAsync(
+    HttpContext context,
+    GoogleCalendarService.AuthenticatedEmployee employee)
+{
+    var claims = new List<Claim>
+    {
+        new(ClaimTypes.NameIdentifier, employee.Email),
+        new(ClaimTypes.Email, employee.Email)
+    };
+
+    if (!string.IsNullOrWhiteSpace(employee.Name))
+        claims.Add(new Claim(ClaimTypes.Name, employee.Name));
+
+    var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
+    await context.SignInAsync(
+        CookieAuthenticationDefaults.AuthenticationScheme,
+        new ClaimsPrincipal(identity),
+        new AuthenticationProperties
+        {
+            IsPersistent = true,
+            ExpiresUtc = DateTimeOffset.UtcNow.AddDays(30)
+        });
+}
+
+static string? GetCurrentEmployeeEmail(HttpContext context)
+{
+    if (context.User.Identity?.IsAuthenticated != true)
+        return null;
+
+    var email =
+        context.User.FindFirstValue(ClaimTypes.Email) ??
+        context.User.FindFirstValue(ClaimTypes.NameIdentifier);
+
+    return string.IsNullOrWhiteSpace(email) ? null : NormalizeEmployeeEmail(email);
+}
+
+static IResult? ValidateEmployeeAccess(HttpContext context, string employeeEmail)
+{
+    var currentEmployeeEmail = GetCurrentEmployeeEmail(context);
+
+    if (currentEmployeeEmail is null)
+    {
+        return Results.Json(
+            new
+            {
+                error = "Sign in with Google before using employee routes.",
+                authUrl = $"/auth/google?loginHint={Uri.EscapeDataString(employeeEmail)}"
+            },
+            statusCode: StatusCodes.Status401Unauthorized);
+    }
+
+    if (!string.Equals(currentEmployeeEmail, employeeEmail, StringComparison.OrdinalIgnoreCase))
+    {
+        return Results.Json(
+            new
+            {
+                error = $"Signed in as '{currentEmployeeEmail}', not '{employeeEmail}'."
+            },
+            statusCode: StatusCodes.Status403Forbidden);
+    }
+
+    return null;
+}
+
+static string? NormalizeEmployeeEmail(string employeeEmail)
+{
+    var normalized = employeeEmail.Trim().ToLowerInvariant();
+    return normalized.Contains('@', StringComparison.Ordinal) ? normalized : null;
+}
+
+static string NormalizeCalendarId(string calendarId) =>
+    string.IsNullOrWhiteSpace(calendarId) ? GoogleCalendarService.DefaultCalendarId : calendarId.Trim();
+
+static SemaphoreSlim GetSyncGate(
+    ConcurrentDictionary<string, SemaphoreSlim> gates,
+    string employeeEmail,
+    string calendarId) =>
+    gates.GetOrAdd($"{employeeEmail}|{calendarId}", _ => new SemaphoreSlim(1, 1));
 
 static string? ValidateEvent(EventRequest request)
 {
@@ -343,6 +609,8 @@ static DateTime AsUtc(DateTime value) =>
 static EventResponse ToEventResponse(LocalEvent local) =>
     new(
         local.Id,
+        local.OwnerEmail,
+        local.CalendarId,
         local.GoogleEventId,
         local.Summary,
         local.Description,
@@ -375,6 +643,8 @@ public sealed record EventRequest(
 
 public sealed record EventResponse(
     int Id,
+    string OwnerEmail,
+    string CalendarId,
     string? GoogleEventId,
     string? Summary,
     string? Description,
@@ -388,10 +658,42 @@ public sealed record EventResponse(
     DateTime? GoogleUpdated);
 
 public sealed record EventListResponse(
+    string EmployeeEmail,
+    string CalendarId,
     int Count,
     IReadOnlyList<EventResponse> Events);
 
+public sealed record AuthStatusResponse(
+    string? CurrentEmployeeEmail,
+    int Count,
+    IReadOnlyList<string> Employees);
+
+public sealed record EmployeeAuthStatusResponse(
+    string EmployeeEmail,
+    bool IsAuthenticated);
+
+public sealed record AuthenticatedEmployeeResponse(
+    string Email,
+    string? Name,
+    bool EmailVerified,
+    string? HostedDomain,
+    string SyncUrl,
+    string EventsUrl);
+
+public sealed record SyncStatusResponse(
+    string EmployeeEmail,
+    string CalendarId,
+    bool IsRunning,
+    bool IsAuthenticated,
+    string? LastSyncUtc,
+    bool HasSyncToken,
+    int IntervalMinutes,
+    string ConflictStrategy,
+    string DatabasePath);
+
 public sealed record SyncRunResponse(
+    string EmployeeEmail,
+    string CalendarId,
     DateTime StartedUtc,
     DateTime FinishedUtc,
     SyncSummaryResponse Summary);

@@ -1,6 +1,9 @@
 using Google;
+using Google.Apis.Auth;
 using Google.Apis.Auth.OAuth2;
 using Google.Apis.Auth.OAuth2.Flows;
+using Google.Apis.Auth.OAuth2.Requests;
+using Google.Apis.Auth.OAuth2.Responses;
 using Google.Apis.Calendar.v3;
 using Google.Apis.Calendar.v3.Data;
 using Google.Apis.Services;
@@ -11,78 +14,301 @@ using System.Net;
 namespace GoogleCalendarSync.Services;
 
 /// <summary>
-/// Thin wrapper around the Google Calendar API v3. Owns authentication and exposes the
-/// list/insert/update/delete operations the sync engine needs. All network calls go through
-/// <see cref="RetryHelper"/> for backoff on rate-limit / transient errors.
+/// Thin wrapper around the Google Calendar API v3. Owns OAuth tokens for multiple employees and
+/// exposes the list/insert/update/delete operations the sync engine needs.
 /// </summary>
 public sealed class GoogleCalendarService
 {
-    private const string UserId = "user";
+    public const string DefaultCalendarId = "primary";
+
+    private static readonly string[] Scopes =
+    {
+        CalendarService.Scope.Calendar,
+        "openid",
+        "email",
+        "profile"
+    };
 
     private readonly GoogleOptions _options;
-    private CalendarService? _service;
+    private readonly SemaphoreSlim _cacheLock = new(1, 1);
+    private readonly Dictionary<string, CalendarService> _services = new(StringComparer.OrdinalIgnoreCase);
 
     public GoogleCalendarService(GoogleOptions options)
     {
         _options = options;
     }
 
-    public bool IsAuthenticated => _service is not null;
-
-    /// <summary>
-    /// Loads a previously granted OAuth token from disk, if one exists.
-    /// </summary>
-    public async Task<bool> TryAuthenticateFromStoreAsync(CancellationToken ct = default)
+    public string CreateAuthorizationUrl(string redirectUri, string? loginHint = null)
     {
         var flow = CreateAuthorizationCodeFlow();
-        var token = await flow.LoadTokenAsync(UserId, ct);
+        var request = (GoogleAuthorizationCodeRequestUrl)flow.CreateAuthorizationCodeRequest(redirectUri);
+        request.AccessType = "offline";
+        request.Prompt = "consent";
+        request.IncludeGrantedScopes = "true";
+        request.LoginHint = loginHint;
+
+        return request.Build().ToString();
+    }
+
+    public async Task<AuthenticatedEmployee> AuthenticateWithCodeAsync(
+        string code,
+        string redirectUri,
+        CancellationToken ct = default)
+    {
+        var flow = CreateAuthorizationCodeFlow();
+        var token = await flow.ExchangeCodeForTokenAsync("pending", code, redirectUri, ct);
+        var profile = await ReadProfileAsync(token);
+        var employeeEmail = NormalizeEmail(profile.Email);
+
+        await flow.DataStore.StoreAsync(employeeEmail, token);
+        await flow.DataStore.DeleteAsync<TokenResponse>("pending");
+
+        await InitializeServiceAsync(employeeEmail, ct);
+
+        return new AuthenticatedEmployee(
+            employeeEmail,
+            profile.Name,
+            profile.EmailVerified,
+            profile.HostedDomain);
+    }
+
+    public async Task<bool> IsAuthenticatedAsync(string employeeEmail, CancellationToken ct = default)
+    {
+        if (_services.ContainsKey(NormalizeEmail(employeeEmail)))
+            return true;
+
+        return await TryLoadServiceAsync(employeeEmail, ct);
+    }
+
+    public async Task<IReadOnlyList<string>> ListAuthenticatedEmployeesAsync(CancellationToken ct = default)
+    {
+        var tokenStore = new FileDataStore(_options.TokenStorePath, fullPath: true);
+        var employees = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        if (Directory.Exists(_options.TokenStorePath))
+        {
+            foreach (var path in Directory.EnumerateFiles(
+                _options.TokenStorePath,
+                "Google.Apis.Auth.OAuth2.Responses.TokenResponse-*"))
+            {
+                var fileName = Path.GetFileName(path);
+                var employeeEmail = Uri.UnescapeDataString(fileName["Google.Apis.Auth.OAuth2.Responses.TokenResponse-".Length..]);
+
+                if (employeeEmail.Equals("pending", StringComparison.OrdinalIgnoreCase) ||
+                    !employeeEmail.Contains('@', StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                var token = await tokenStore.GetAsync<TokenResponse>(employeeEmail);
+                if (token is not null)
+                    employees.Add(employeeEmail);
+            }
+        }
+
+        await _cacheLock.WaitAsync(ct);
+        try
+        {
+            foreach (var employeeEmail in _services.Keys)
+                employees.Add(employeeEmail);
+        }
+        finally
+        {
+            _cacheLock.Release();
+        }
+
+        return employees.ToList();
+    }
+
+    public async Task<ListResult> ListEventsAsync(
+        string employeeEmail,
+        string calendarId,
+        string? syncToken,
+        CancellationToken ct = default)
+    {
+        var service = await GetServiceAsync(employeeEmail, ct);
+        var all = new List<Event>();
+        string? pageToken = null;
+        string? nextSyncToken = null;
+
+        do
+        {
+            EventsResource.ListRequest request = service.Events.List(calendarId);
+            request.ShowDeleted = true;
+            request.SingleEvents = true;
+            request.MaxResults = 250;
+            request.PageToken = pageToken;
+
+            if (!string.IsNullOrEmpty(syncToken))
+            {
+                request.SyncToken = syncToken;
+            }
+            else
+            {
+                request.TimeMinDateTimeOffset = DateTimeOffset.UtcNow.AddYears(-1);
+            }
+
+            Events page;
+            try
+            {
+                page = await RetryHelper.ExecuteAsync(() => request.ExecuteAsync(ct), ct: ct);
+            }
+            catch (GoogleApiException ex) when (ex.HttpStatusCode == HttpStatusCode.Gone)
+            {
+                return new ListResult(Array.Empty<Event>(), null, SyncTokenExpired: true);
+            }
+
+            if (page.Items != null)
+                all.AddRange(page.Items);
+
+            pageToken = page.NextPageToken;
+            nextSyncToken = page.NextSyncToken;
+        }
+        while (!string.IsNullOrEmpty(pageToken));
+
+        return new ListResult(all, nextSyncToken, SyncTokenExpired: false);
+    }
+
+    public async Task<Event> InsertAsync(
+        string employeeEmail,
+        string calendarId,
+        Event body,
+        CancellationToken ct = default)
+    {
+        var service = await GetServiceAsync(employeeEmail, ct);
+        return await RetryHelper.ExecuteAsync(() => service.Events.Insert(body, calendarId).ExecuteAsync(ct), ct: ct);
+    }
+
+    public async Task<Event> UpdateAsync(
+        string employeeEmail,
+        string calendarId,
+        string eventId,
+        Event body,
+        CancellationToken ct = default)
+    {
+        var service = await GetServiceAsync(employeeEmail, ct);
+        return await RetryHelper.ExecuteAsync(() => service.Events.Update(body, calendarId, eventId).ExecuteAsync(ct), ct: ct);
+    }
+
+    public async Task DeleteAsync(
+        string employeeEmail,
+        string calendarId,
+        string eventId,
+        CancellationToken ct = default)
+    {
+        var service = await GetServiceAsync(employeeEmail, ct);
+
+        try
+        {
+            await RetryHelper.ExecuteAsync(
+                () => service.Events.Delete(calendarId, eventId).ExecuteAsync(ct), ct: ct);
+        }
+        catch (GoogleApiException ex) when (
+            ex.HttpStatusCode is HttpStatusCode.NotFound or HttpStatusCode.Gone)
+        {
+            // Already deleted on the server.
+        }
+    }
+
+    private async Task<CalendarService> GetServiceAsync(string employeeEmail, CancellationToken ct)
+    {
+        var normalizedEmail = NormalizeEmail(employeeEmail);
+
+        await _cacheLock.WaitAsync(ct);
+        try
+        {
+            if (_services.TryGetValue(normalizedEmail, out var cached))
+                return cached;
+        }
+        finally
+        {
+            _cacheLock.Release();
+        }
+
+        if (await TryLoadServiceAsync(normalizedEmail, ct))
+        {
+            await _cacheLock.WaitAsync(ct);
+            try
+            {
+                return _services[normalizedEmail];
+            }
+            finally
+            {
+                _cacheLock.Release();
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"Google is not authenticated for '{normalizedEmail}'. Open /auth/google?loginHint={Uri.EscapeDataString(normalizedEmail)} first.");
+    }
+
+    private async Task<bool> TryLoadServiceAsync(string employeeEmail, CancellationToken ct)
+    {
+        var normalizedEmail = NormalizeEmail(employeeEmail);
+        var flow = CreateAuthorizationCodeFlow();
+        var token = await flow.LoadTokenAsync(normalizedEmail, ct);
 
         if (token is null)
             return false;
 
-        InitializeService(new UserCredential(flow, UserId, token));
+        InitializeService(normalizedEmail, new UserCredential(flow, normalizedEmail, token));
         return true;
     }
 
-    public string CreateAuthorizationUrl(string redirectUri)
+    private async Task InitializeServiceAsync(string employeeEmail, CancellationToken ct)
     {
-        var flow = CreateAuthorizationCodeFlow();
-        return flow.CreateAuthorizationCodeRequest(redirectUri).Build().ToString();
+        var loaded = await TryLoadServiceAsync(employeeEmail, ct);
+
+        if (!loaded)
+            throw new InvalidOperationException($"Could not load Google token for '{employeeEmail}'.");
     }
 
-    public async Task AuthenticateWithCodeAsync(string code, string redirectUri, CancellationToken ct = default)
+    private void InitializeService(string employeeEmail, UserCredential credential)
     {
-        var flow = CreateAuthorizationCodeFlow();
-        var token = await flow.ExchangeCodeForTokenAsync(UserId, code, redirectUri, ct);
-        InitializeService(new UserCredential(flow, UserId, token));
+        var service = new CalendarService(new BaseClientService.Initializer
+        {
+            HttpClientInitializer = credential,
+            ApplicationName = _options.ApplicationName
+        });
+
+        _cacheLock.Wait();
+        try
+        {
+            _services[NormalizeEmail(employeeEmail)] = service;
+        }
+        finally
+        {
+            _cacheLock.Release();
+        }
     }
 
     private GoogleAuthorizationCodeFlow CreateAuthorizationCodeFlow() =>
         new(new GoogleAuthorizationCodeFlow.Initializer
         {
             ClientSecrets = ResolveClientSecrets(),
-            Scopes = new[] { CalendarService.Scope.Calendar },
+            Scopes = Scopes,
             DataStore = new FileDataStore(_options.TokenStorePath, fullPath: true)
         });
 
-    private void InitializeService(UserCredential credential)
+    private async Task<GoogleJsonWebSignature.Payload> ReadProfileAsync(TokenResponse token)
     {
-        _service = new CalendarService(new BaseClientService.Initializer
-        {
-            HttpClientInitializer = credential,
-            ApplicationName = _options.ApplicationName
-        });
+        if (string.IsNullOrWhiteSpace(token.IdToken))
+            throw new InvalidOperationException("Google did not return an id_token. Make sure openid and email scopes are enabled.");
+
+        var clientId = ResolveClientSecrets().ClientId;
+        var payload = await GoogleJsonWebSignature.ValidateAsync(
+            token.IdToken,
+            new GoogleJsonWebSignature.ValidationSettings
+            {
+                Audience = new[] { clientId }
+            });
+
+        if (string.IsNullOrWhiteSpace(payload.Email))
+            throw new InvalidOperationException("Google did not return an email for this account.");
+
+        return payload;
     }
 
-    private CalendarService Service =>
-        _service ?? throw new InvalidOperationException("Call AuthenticateAsync() first.");
-
-    /// <summary>
-    /// Resolves the OAuth client id/secret. A downloaded credentials JSON (see
-    /// <see cref="GoogleOptions.CredentialsPath"/>) wins if present — this handles both the
-    /// "installed" (Desktop app) and "web" JSON shapes via the library parser — otherwise we fall
-    /// back to explicit <c>ClientId</c>/<c>ClientSecret</c> from appsettings.json / environment vars.
-    /// </summary>
     private ClientSecrets ResolveClientSecrets()
     {
         var credentialsFile = ResolveCredentialsFile();
@@ -111,11 +337,6 @@ public sealed class GoogleCalendarService
             "in appsettings.json (or the Google__ClientId / Google__ClientSecret environment variables).");
     }
 
-    /// <summary>
-    /// Finds a credentials JSON file. <see cref="GoogleOptions.CredentialsPath"/> may be a file or a
-    /// folder (first *.json wins). Relative paths are probed against both the current working
-    /// directory and the app base directory so it works from `dotnet run` and a published exe.
-    /// </summary>
     private string? ResolveCredentialsFile()
     {
         var configured = string.IsNullOrWhiteSpace(_options.CredentialsPath)
@@ -146,88 +367,17 @@ public sealed class GoogleCalendarService
         return null;
     }
 
-    /// <summary>
-    /// Result of an incremental (or full) list. <see cref="Events"/> contains every changed
-    /// event page-by-page; <see cref="NextSyncToken"/> is the token to persist for the next run;
-    /// <see cref="SyncTokenExpired"/> is true when the supplied token was rejected (HTTP 410) and
-    /// the caller must fall back to a full sync.
-    /// </summary>
+    private static string NormalizeEmail(string employeeEmail) =>
+        employeeEmail.Trim().ToLowerInvariant();
+
+    public sealed record AuthenticatedEmployee(
+        string Email,
+        string? Name,
+        bool EmailVerified,
+        string? HostedDomain);
+
     public sealed record ListResult(
         IReadOnlyList<Event> Events,
         string? NextSyncToken,
         bool SyncTokenExpired);
-
-    /// <summary>
-    /// Pulls changes from Google. Pass the previously stored <paramref name="syncToken"/> for an
-    /// incremental pull, or null for a full sync. If Google rejects the token with 410 Gone, this
-    /// returns <see cref="ListResult.SyncTokenExpired"/> = true so the caller can retry full.
-    /// </summary>
-    public async Task<ListResult> ListEventsAsync(string? syncToken, CancellationToken ct = default)
-    {
-        var all = new List<Event>();
-        string? pageToken = null;
-        string? nextSyncToken = null;
-
-        do
-        {
-            EventsResource.ListRequest request = Service.Events.List(_options.CalendarId);
-            request.ShowDeleted = true;              // needed to observe cancelled/deleted events
-            request.SingleEvents = true;             // expand recurring events into instances
-            request.MaxResults = 250;
-            request.PageToken = pageToken;
-
-            if (!string.IsNullOrEmpty(syncToken))
-            {
-                request.SyncToken = syncToken;
-            }
-            else
-            {
-                // Full sync: bound the window so we don't drag in ancient history.
-                request.TimeMinDateTimeOffset = DateTimeOffset.UtcNow.AddYears(-1);
-            }
-
-            Events page;
-            try
-            {
-                page = await RetryHelper.ExecuteAsync(() => request.ExecuteAsync(ct), ct: ct);
-            }
-            catch (GoogleApiException ex) when (ex.HttpStatusCode == HttpStatusCode.Gone)
-            {
-                // 410: the sync token is no longer valid. Signal the caller to do a full sync.
-                return new ListResult(Array.Empty<Event>(), null, SyncTokenExpired: true);
-            }
-
-            if (page.Items != null)
-                all.AddRange(page.Items);
-
-            pageToken = page.NextPageToken;
-            nextSyncToken = page.NextSyncToken; // only present on the last page
-        }
-        while (!string.IsNullOrEmpty(pageToken));
-
-        return new ListResult(all, nextSyncToken, SyncTokenExpired: false);
-    }
-
-    public Task<Event> InsertAsync(Event body, CancellationToken ct = default) =>
-        RetryHelper.ExecuteAsync(() => Service.Events.Insert(body, _options.CalendarId).ExecuteAsync(ct), ct: ct);
-
-    public Task<Event> UpdateAsync(string eventId, Event body, CancellationToken ct = default) =>
-        RetryHelper.ExecuteAsync(() => Service.Events.Update(body, _options.CalendarId, eventId).ExecuteAsync(ct), ct: ct);
-
-    /// <summary>
-    /// Deletes an event. A 404/410 (already gone) is treated as success so delete is idempotent.
-    /// </summary>
-    public async Task DeleteAsync(string eventId, CancellationToken ct = default)
-    {
-        try
-        {
-            await RetryHelper.ExecuteAsync(
-                () => Service.Events.Delete(_options.CalendarId, eventId).ExecuteAsync(ct), ct: ct);
-        }
-        catch (GoogleApiException ex) when (
-            ex.HttpStatusCode is HttpStatusCode.NotFound or HttpStatusCode.Gone)
-        {
-            // Already deleted on the server — nothing to do.
-        }
-    }
 }

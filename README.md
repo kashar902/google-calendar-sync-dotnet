@@ -6,7 +6,8 @@ SQLite store and **Google Calendar** using the Google Calendar API v3.
 - Pull from Google to local SQLite with incremental sync tokens.
 - Push local creates, updates, and deletes back to Google Calendar.
 - Resolve conflicts with `LastWriteWins`, `GoogleWins`, or `LocalWins`.
-- Expose sync, auth, and local event operations through HTTP endpoints.
+- Let each employee authenticate their own Google account and manage their own calendar sync.
+- Expose employee-scoped sync, auth, and local event operations through HTTP endpoints.
 - Provide Swagger/OpenAPI documentation at `/swagger`.
 
 ---
@@ -61,9 +62,10 @@ Services/
 2. Create or select a project.
 3. Enable **Google Calendar API**.
 4. Configure the OAuth consent screen:
-   - User type: **External** or **Internal**.
+   - User type: **External** if any Google account should be able to authorize.
+   - User type: **Internal** if only Google Workspace users in your organization should authorize.
    - Add your account under **Test users** while the app is in testing.
-   - Add the scope `https://www.googleapis.com/auth/calendar`.
+   - Add scopes for Google Calendar plus `openid`, `email`, and `profile`.
 5. Create credentials:
    - Go to **APIs & Services -> Credentials**.
    - Click **Create Credentials -> OAuth client ID**.
@@ -115,10 +117,10 @@ Config keys:
 | Key | Meaning |
 | --- | --- |
 | `Google:CredentialsPath` | Folder or exact JSON file path for the OAuth client JSON. |
-| `Google:CalendarId` | Calendar to sync. `primary` means the signed-in user's main calendar. |
+| `Google:CalendarId` | Default calendar id. Employee routes use `calendarId=primary` unless another id is supplied. |
 | `Google:TokenStorePath` | Folder where the OAuth refresh token is cached. |
 | `Sync:DatabasePath` | SQLite database file for local event rows. |
-| `Sync:IntervalMinutes` | Reserved sync interval setting. Manual sync currently runs through `POST /sync/run`. |
+| `Sync:IntervalMinutes` | Reserved sync interval setting. Manual sync currently runs through employee sync routes. |
 | `Sync:ConflictStrategy` | `LastWriteWins`, `GoogleWins`, or `LocalWins`. |
 
 Do not commit real secrets. Prefer `appsettings.Local.json` or environment variables for private
@@ -146,27 +148,42 @@ http://localhost:5000/swagger/v1/swagger.json
 
 ---
 
-## 4. Authenticate With Google
+## 4. Employee Authentication
 
-Start the API first, then open:
+Each employee authorizes their own Google account. Start the API first, then an employee opens:
 
 ```text
 http://localhost:5000/auth/google
 ```
 
-Sign in and approve access. Google redirects back to:
+You can pre-fill the Google sign-in screen with:
+
+```text
+http://localhost:5000/auth/google?loginHint=employee@example.com
+```
+
+The employee signs in and approves access. Google redirects back to:
 
 ```text
 http://localhost:5000/auth/google/callback
 ```
 
-After success, the refresh token is cached under `token_store/`, so you usually only need to sign in
-once.
+After success, the refresh token is cached under `token_store/` using that employee's email address.
+The API also signs the browser into a local cookie for that employee. Employee-scoped routes only
+allow access when the cookie email matches `{employeeEmail}`.
+
+Each employee has their own token, events, and sync metadata.
 
 Check auth status:
 
 ```http
 GET /auth/status
+```
+
+Check one employee:
+
+```http
+GET /employees/employee@example.com/auth/status
 ```
 
 ---
@@ -176,16 +193,22 @@ GET /auth/status
 | Method | Route | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Health check. |
-| `GET` | `/auth/status` | Check whether Google auth is loaded. |
-| `GET` | `/auth/google` | Start Google OAuth login. |
+| `GET` | `/auth/status` | List authenticated employees. |
+| `GET` | `/auth/google?loginHint=employee@example.com` | Start Google OAuth login. |
 | `GET` | `/auth/google/callback` | Google OAuth redirect target. |
-| `GET` | `/sync/status` | View sync/auth/database status. |
-| `POST` | `/sync/run` | Run one pull-then-push sync cycle. |
-| `GET` | `/events` | List local events. |
-| `GET` | `/events/{id}` | Get one local event. |
-| `POST` | `/events` | Create a local event and mark it dirty for push. |
-| `PUT` | `/events/{id}` | Update a local event and mark it dirty for push. |
-| `DELETE` | `/events/{id}` | Delete/tombstone a local event for push. |
+| `POST` | `/auth/logout` | Clear the local employee auth cookie. |
+| `GET` | `/employees` | List employees with stored Google tokens. |
+| `GET` | `/employees/{employeeEmail}/auth/status` | Check one employee's auth state. |
+| `GET` | `/employees/{employeeEmail}/sync/status` | View employee sync/auth/database status. |
+| `POST` | `/employees/{employeeEmail}/sync/run` | Run one employee pull-then-push sync cycle. |
+| `GET` | `/employees/{employeeEmail}/events` | List one employee's local events. |
+| `GET` | `/employees/{employeeEmail}/events/{id}` | Get one employee event. |
+| `POST` | `/employees/{employeeEmail}/events` | Create a local event and mark it dirty for push. |
+| `PUT` | `/employees/{employeeEmail}/events/{id}` | Update a local event and mark it dirty for push. |
+| `DELETE` | `/employees/{employeeEmail}/events/{id}` | Delete/tombstone a local event for push. |
+
+All employee-scoped routes accept an optional `calendarId` query parameter. If omitted, it uses
+`primary`.
 
 Example create/update payload:
 
@@ -203,19 +226,19 @@ Example create/update payload:
 Run a sync:
 
 ```http
-POST /sync/run
+POST /employees/employee@example.com/sync/run
 ```
 
 Then view local rows:
 
 ```http
-GET /events
+GET /employees/employee@example.com/events
 ```
 
 To include tombstoned/deleted rows:
 
 ```http
-GET /events?includeDeleted=true
+GET /employees/employee@example.com/events?includeDeleted=true
 ```
 
 ---
@@ -241,7 +264,7 @@ The actual calendar data also exists in Google Calendar for the configured `Goog
 
 ## How Sync Works
 
-Each sync cycle runs in this order:
+Each employee/calendar sync cycle runs in this order:
 
 1. Pull changes from Google Calendar into SQLite.
 2. Resolve any Google-vs-local conflicts.
@@ -265,7 +288,9 @@ Push behavior:
 
 ## Notes
 
-- Single-calendar sync only. Multi-calendar support would loop over calendar IDs.
+- Employees do not have to be in the same organization if the OAuth consent screen is External.
+- Use an Internal Google Workspace OAuth consent screen if only your organization should authorize.
+- Multiple calendars are supported by passing `calendarId` on employee routes.
 - Recurring events are expanded into instances with `SingleEvents=true`.
 - Secrets, tokens, credentials, logs, and SQLite files are git-ignored.
 - If Google shows `redirect_uri_mismatch`, check that the URL in Google Cloud Console exactly
