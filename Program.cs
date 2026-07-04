@@ -126,7 +126,12 @@ app.MapGet("/auth/google", (string? loginHint, HttpRequest request, GoogleCalend
 {
     var redirectUri = BuildGoogleRedirectUri(request);
     var authorizationUrl = googleService.CreateAuthorizationUrl(redirectUri, loginHint);
-    return Results.Redirect(authorizationUrl);
+    return Results.Ok(new
+    {
+        statusCodes = 200,
+        message = "click this below URL for the redirection and verify your account",
+        authorizationUrl
+    });
 })
     .WithName("StartGoogleAuth")
     .WithTags("Authentication");
